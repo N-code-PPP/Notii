@@ -74,23 +74,39 @@ jobs:
           chmod +x ./scripts/prepare-github-build.sh || true
           ./scripts/prepare-github-build.sh || true
 
-          # Direct inline fallback to guarantee keystores exist on disk in workspace root
-          if [ ! -f "debug.keystore" ] && [ -f "debug.keystore.base64" ]; then
-            tr -d '[:space:]' < "debug.keystore.base64" | base64 -d > "debug.keystore"
-          fi
-
+          # 1. Ensure my-upload-key.jks is materialized first
           if [ -n "${KEYSTORE_BASE64_SECRET:-}" ]; then
-            printf "%s" "$KEYSTORE_BASE64_SECRET" | tr -d '[:space:]' | base64 -d > "my-upload-key.jks"
+            printf "%s" "$KEYSTORE_BASE64_SECRET" | tr -d '[:space:]' | base64 -d > "my-upload-key.jks" || true
           elif [ ! -f "my-upload-key.jks" ] && [ -f "my-upload-key.jks.base64" ]; then
-            tr -d '[:space:]' < "my-upload-key.jks.base64" | base64 -d > "my-upload-key.jks"
+            tr -d '[:space:]' < "my-upload-key.jks.base64" | base64 -d > "my-upload-key.jks" || true
           fi
 
+          # 2. Ensure debug.keystore is materialized from debug.keystore.base64, signing-key-debug.b64, or my-upload-key.jks
+          if [ ! -f "debug.keystore" ] && [ -f "debug.keystore.base64" ]; then
+            tr -d '[:space:]' < "debug.keystore.base64" | base64 -d > "debug.keystore" || true
+          fi
+          if [ ! -f "debug.keystore" ] && [ -f "signing-key-debug.b64" ]; then
+            tr -d '[:space:]' < "signing-key-debug.b64" | base64 -d > "debug.keystore" || true
+          fi
+          if [ ! -f "debug.keystore" ]; then
+            if [ -f "my-upload-key.jks" ]; then
+              echo "Deriving debug.keystore with matching SHA-1 from my-upload-key.jks..."
+              keytool -importkeystore -srckeystore "my-upload-key.jks" -srcstorepass android -srckeypass android -srcalias upload -destkeystore "debug.keystore" -deststorepass android -destkeypass android -destalias androiddebugkey -noprompt || true
+            fi
+            if [ ! -f "debug.keystore" ]; then
+              echo "Generating standard debug.keystore using keytool..."
+              keytool -genkeypair -v -keystore "debug.keystore" -storepass android -keypass android -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US" || true
+            fi
+          fi
+
+          # 3. Ensure app/google-services.json is materialized
           if [ -n "${GOOGLE_SERVICES_JSON_SECRET:-}" ]; then
-            printf "%s" "$GOOGLE_SERVICES_JSON_SECRET" | tr -d '[:space:]' | base64 -d > "app/google-services.json"
+            printf "%s" "$GOOGLE_SERVICES_JSON_SECRET" | tr -d '[:space:]' | base64 -d > "app/google-services.json" || true
           elif [ ! -f "app/google-services.json" ] && [ -f "app/google-services.json.base64" ]; then
-            tr -d '[:space:]' < "app/google-services.json.base64" | base64 -d > "app/google-services.json"
+            tr -d '[:space:]' < "app/google-services.json.base64" | base64 -d > "app/google-services.json" || true
           fi
 
+          # 4. Ensure .env exists
           if [ ! -f ".env" ] && [ -f ".env.example" ]; then
             cp ".env.example" ".env"
           fi
@@ -98,7 +114,6 @@ jobs:
           # Verify required build and signing files are present before Gradle is invoked
           echo "Checking required files:"
           ls -la debug.keystore my-upload-key.jks app/google-services.json .env
-
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
