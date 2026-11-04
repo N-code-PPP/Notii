@@ -20,6 +20,13 @@ ensureKeystoreFromBase64(
   base64File = file("my-upload-key.jks.base64")
 )
 
+val googleServicesFile = file("app/google-services.json")
+val googleServicesBase64File = file("app/google-services.json.base64")
+if (!googleServicesFile.exists() && googleServicesBase64File.exists()) {
+  val cleaned = googleServicesBase64File.readText().replace("\\s".toRegex(), "")
+  googleServicesFile.writeBytes(Base64.getDecoder().decode(cleaned))
+}
+
 val envFile = file(".env")
 val envExampleFile = file(".env.example")
 if (!envFile.exists() && envExampleFile.exists()) {
@@ -27,6 +34,7 @@ if (!envFile.exists() && envExampleFile.exists()) {
 }
 
 plugins {
+
   alias(libs.plugins.android.application) apply false
   alias(libs.plugins.kotlin.compose) apply false
   alias(libs.plugins.google.devtools.ksp) apply false

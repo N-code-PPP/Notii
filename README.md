@@ -31,10 +31,15 @@ Both Debug and Release signing configurations are pre-configured in `app/build.g
 | **Debug** (`debugConfig`) | `debug.keystore` | `debug.keystore.base64` | `androiddebugkey` | `android` / `android` |
 | **Release** (`release`) | `my-upload-key.jks` | `my-upload-key.jks.base64` | `upload` | `STORE_PASSWORD` / `KEY_PASSWORD` (defaults to `android` in CI) |
 
-> **Note:** On a fresh `git clone`, the root `build.gradle.kts` (or `./scripts/prepare-github-build.sh`) automatically decodes `debug.keystore.base64` -> `debug.keystore`, `my-upload-key.jks.base64` -> `my-upload-key.jks`, and copies `.env.example` -> `.env` if any of those files are not yet present.
+> **Note:** On a fresh `git clone`, the root `build.gradle.kts` (or `./scripts/prepare-github-build.sh`) automatically:
+> - Decodes `debug.keystore.base64` -> `debug.keystore`
+> - Decodes `my-upload-key.jks.base64` -> `my-upload-key.jks`
+> - Decodes `app/google-services.json.base64` -> `app/google-services.json`
+> - Copies `.env.example` -> `.env`
 
-### Optional GitHub Actions Secrets (Custom Release Keystore)
-The workflow works with **zero configuration** out of the box using the included signing key. If you wish to override the release keystore via GitHub Repository Secrets (**Settings -> Secrets and variables -> Actions**):
+### Optional GitHub Actions Secrets (Custom Configuration)
+The workflow works with **zero configuration** out of the box using the included signing key and Firebase configuration. If you wish to override values via GitHub Repository Secrets (**Settings -> Secrets and variables -> Actions**):
+- `GOOGLE_SERVICES_JSON`: Optional base64-encoded `google-services.json` to override Firebase project configuration.
 - `KEYSTORE_BASE64`: Base64-encoded `.jks` keystore containing key alias `upload` (defaults to `my-upload-key.jks.base64`).
 - `STORE_PASSWORD`: Keystore password (defaults to `android`).
 - `KEY_PASSWORD`: Key password for alias `upload` (defaults to `android`).

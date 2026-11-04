@@ -49,4 +49,13 @@ elif [ ! -f "my-upload-key.jks" ] && [ -f "my-upload-key.jks.base64" ]; then
   echo "  [OK] Materialized my-upload-key.jks from my-upload-key.jks.base64"
 fi
 
+# 5. Restore app/google-services.json from GOOGLE_SERVICES_JSON_SECRET or app/google-services.json.base64
+if [ -n "${GOOGLE_SERVICES_JSON_SECRET:-}" ]; then
+  printf "%s" "$GOOGLE_SERVICES_JSON_SECRET" | tr -d '[:space:]' | base64 -d > "app/google-services.json"
+  echo "  [OK] Materialized app/google-services.json from GOOGLE_SERVICES_JSON secret"
+elif [ ! -f "app/google-services.json" ] && [ -f "app/google-services.json.base64" ]; then
+  tr -d '[:space:]' < "app/google-services.json.base64" | base64 -d > "app/google-services.json"
+  echo "  [OK] Materialized app/google-services.json from app/google-services.json.base64"
+fi
+
 echo "==> Environment and signing keys are ready."

@@ -68,6 +68,7 @@ jobs:
         env:
           KEYSTORE_BASE64_SECRET: ${{ secrets.KEYSTORE_BASE64 }}
           GOOGLE_WEB_CLIENT_ID_SECRET: ${{ secrets.GOOGLE_WEB_CLIENT_ID }}
+          GOOGLE_SERVICES_JSON_SECRET: ${{ secrets.GOOGLE_SERVICES_JSON }}
         run: |
           chmod +x ./gradlew
           chmod +x ./scripts/prepare-github-build.sh
