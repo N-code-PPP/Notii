@@ -1,0 +1,196 @@
+{
+  "entities": {
+    "Note": {
+      "title": "Note",
+      "description": "A user-authored note supporting rich text/markdown, folder assignment, archive, trash soft-delete, version history snapshots, category tagging, custom reminder notifications, offline sync, and optional password encryption.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "The UID of the authenticated Google user who owns this note."
+        },
+        "title": {
+          "type": "string",
+          "description": "The title of the note (up to 200 characters)."
+        },
+        "content": {
+          "type": "string",
+          "description": "The plain text body of the note, or a placeholder when locked (up to 20000 characters)."
+        },
+        "folderId": {
+          "type": "string",
+          "description": "ID of the folder this note belongs to, or empty string if unfiled (up to 128 characters)."
+        },
+        "category": {
+          "type": "string",
+          "description": "Primary category name (up to 50 characters)."
+        },
+        "tags": {
+          "type": "array",
+          "description": "Bounded list of up to 10 string tags associated with the note."
+        },
+        "colorHex": {
+          "type": "string",
+          "description": "Optional accent color identifier for the note card (up to 20 characters)."
+        },
+        "isPinned": {
+          "type": "boolean",
+          "description": "Whether the note is pinned to the top of the workspace."
+        },
+        "isArchived": {
+          "type": "boolean",
+          "description": "Whether the note is archived out of the main workspace."
+        },
+        "isTrashed": {
+          "type": "boolean",
+          "description": "Whether the note is in the Trash Bin awaiting restore or permanent deletion."
+        },
+        "trashedAtEpochMillis": {
+          "type": "integer",
+          "description": "Epoch timestamp in milliseconds when the note was moved to Trash, or 0 if active."
+        },
+        "isLocked": {
+          "type": "boolean",
+          "description": "Whether the note is password-protected."
+        },
+        "passwordHash": {
+          "type": "string",
+          "description": "SHA-256 salted verification hash for unlocking the sensitive note (up to 256 characters)."
+        },
+        "encryptedPayload": {
+          "type": "string",
+          "description": "AES-GCM encrypted note body when isLocked is true (up to 30000 characters)."
+        },
+        "reminderEpochMillis": {
+          "type": "integer",
+          "description": "Scheduled push notification epoch timestamp in milliseconds, or 0 if none."
+        },
+        "reminderLabel": {
+          "type": "string",
+          "description": "Custom reminder notification note/label (up to 100 characters)."
+        },
+        "versionHistory": {
+          "type": "array",
+          "description": "Bounded list of up to 10 serialized revision snapshots for version history recovery."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the note was created. Clients must submit FieldValue.serverTimestamp()."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the note was last modified. Clients must submit FieldValue.serverTimestamp()."
+        }
+      },
+      "required": [
+        "userId",
+        "title",
+        "content",
+        "category",
+        "tags",
+        "colorHex",
+        "isPinned",
+        "isLocked",
+        "passwordHash",
+        "encryptedPayload",
+        "reminderEpochMillis",
+        "reminderLabel",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "Category": {
+      "title": "Category",
+      "description": "A user-defined custom category/tag group for organizing notes.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "The UID of the authenticated user who owns this category."
+        },
+        "name": {
+          "type": "string",
+          "description": "Display name of the category (1 to 40 characters)."
+        },
+        "colorHex": {
+          "type": "string",
+          "description": "Color identifier for the category badge (up to 20 characters)."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the category was created. Clients must submit FieldValue.serverTimestamp()."
+        }
+      },
+      "required": [
+        "userId",
+        "name",
+        "colorHex",
+        "createdAt"
+      ]
+    },
+    "Folder": {
+      "title": "Folder",
+      "description": "A user-defined folder for hierarchical organization of notes, supporting create, rename, move (nested parent folder), and delete.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "The UID of the authenticated user who owns this folder."
+        },
+        "name": {
+          "type": "string",
+          "description": "Display name of the folder (1 to 60 characters)."
+        },
+        "parentFolderId": {
+          "type": "string",
+          "description": "ID of the parent folder, or empty string if at root level (up to 128 characters)."
+        },
+        "colorHex": {
+          "type": "string",
+          "description": "Accent color identifier for the folder icon/badge (up to 20 characters)."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the folder was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the folder was last renamed or moved."
+        }
+      },
+      "required": [
+        "userId",
+        "name",
+        "parentFolderId",
+        "colorHex",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/notes/{noteId}": {
+      "schema": {
+        "$ref": "#/entities/Note"
+      },
+      "description": "Per-user synchronized notes collection."
+    },
+    "/users/{userId}/categories/{categoryId}": {
+      "schema": {
+        "$ref": "#/entities/Category"
+      },
+      "description": "Per-user custom categories collection."
+    },
+    "/users/{userId}/folders/{folderId}": {
+      "schema": {
+        "$ref": "#/entities/Folder"
+      },
+      "description": "Per-user hierarchical folders collection."
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "Notii",
+  "description": "Fast, clutter-free note taking with cloud synchronization, offline support, voice-to-text, custom reminders, tags, home screen widget, and password-protected vault notes.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

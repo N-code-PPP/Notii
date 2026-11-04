@@ -1,0 +1,26 @@
+<resources>
+    <string name="app_name">Notii</string>
+    <string name="auth_tagline">Fast, clutter-free notes with real-time cloud sync, offline cache, voice dictation, reminders, and AES-256 vault security.</string>
+    <string name="sign_in_with_google">Sign in with Google</string>
+    <string name="feature_cloud_title">Cloud Sync &amp; Offline Mode</string>
+    <string name="feature_cloud_desc">Automatic real-time Firestore sync with full offline editing and instant local caching.</string>
+    <string name="feature_voice_title">Voice-to-Text Capture</string>
+    <string name="feature_voice_desc">Hands-free live speech dictation and quick voice snippets for effortless note taking.</string>
+    <string name="feature_vault_title">Password-Protected Vault</string>
+    <string name="feature_vault_desc">Lock sensitive notes with a personal password using AES-256-GCM encryption.</string>
+    <string name="feature_reminders_title">Custom Push Reminders &amp; Widget</string>
+    <string name="feature_reminders_desc">Schedule custom push notifications and capture notes from your Home Screen widget.</string>
+    <string name="notification_channel_name">Note Reminders</string>
+    <string name="notification_channel_desc">Custom push notifications for scheduled important note reminders</string>
+    <string name="default_reminder_title">Notii Reminder</string>
+    <string name="default_reminder_body">You have an important scheduled note reminder.</string>
+    <string name="locked_note_reminder_body">Password-protected vault note reminder. Tap to unlock in Notii.</string>
+    <string name="widget_description">Quick access to your pinned notes, + Quick Note, and Quick Camera Document Shot from your Home Screen.</string>
+    <string name="widget_default_subtitle">Cloud Synced • Offline Ready</string>
+    <string name="widget_voice_btn">Voice</string>
+    <string name="widget_camera_shot_btn">📷 Doc Shot</string>
+    <string name="widget_quick_note_btn">+ Quick</string>
+    <string name="widget_quick_camera_title">Notii Quick Camera</string>
+    <string name="widget_quick_camera_subtitle">10-Shot Private Doc Capture</string>
+    <string name="widget_quick_camera_description">1-tap Home Screen shortcut to launch Notii Quick Camera Shot (up to 10 consecutive private document captures).</string>
+</resources>

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <files-path
+        name="private_doc_captures"
+        path="private_doc_captures/" />
+    <files-path
+        name="private_exports"
+        path="private_exports/" />
+    <cache-path
+        name="shared_exports"
+        path="exports/" />
+</paths>
