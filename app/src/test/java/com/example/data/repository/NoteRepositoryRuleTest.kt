@@ -10,7 +10,9 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
+import org.robolectric.annotation.Config
 
+@Config(sdk = [36])
 class NoteRepositoryRuleTest : FirestoreEmulatorTestBase() {
 
     @Test
@@ -84,6 +86,11 @@ class NoteRepositoryRuleTest : FirestoreEmulatorTestBase() {
         assertTrue(updatedNote.isArchived)
         assertTrue(updatedNote.isTrashed)
         assertEquals(2, updatedNote.versionHistory.size)
+
+        val deleteRes = withTimeout(DEFAULT_TIMEOUT_MS) {
+            repository.deleteNote(noteId)
+        }
+        assertTrue(deleteRes.isSuccess)
     }
 
     @Test

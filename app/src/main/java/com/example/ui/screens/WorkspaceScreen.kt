@@ -2064,20 +2064,20 @@ fun WorkspaceScreen(
                 )
             },
             title = {
-                Text(if (viewModel.isLocalGuestMode) "Local Mode & Optional Cloud Sync" else "Cloud Sync & Offline Mode")
+                Text(if (viewModel.isLocalGuestMode) "Local Mode & Optional Cloud Sync" else "Cloud Sync & Multi-Device Deduplication")
             },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Text(
                         text = if (viewModel.isLocalGuestMode) {
-                            "You are using Notii without signing in. All notes, folders, archive, trash, and version history are stored locally on your device. Sign in with Google anytime if you want real-time cloud synchronization."
+                            "You are using Notii without signing in. All notes, folders, archive, trash, and version history are stored locally on your device. Sign in with Google anytime if you want real-time cloud synchronization with automatic duplicate prevention."
                         } else {
-                            "Notii automatically caches all notes, folders, and version history on-device for instant offline access and synchronizes with Cloud Firestore in real time."
+                            "Notii automatically caches all notes, folders, and version history on-device for instant offline access and synchronizes across multiple devices using deterministic IDs and content fingerprinting to prevent duplicate notes."
                         },
                         style = MaterialTheme.typography.bodyMedium
                     )
                     Text(
-                        text = "• Active Notes: ${activeWorkspaceNotes.size}\n• Archived: $archivedCount • Trash: $trashedCount\n• Total Folders: ${folders.size}\n• Mode: ${
+                        text = "• Active Notes: ${activeWorkspaceNotes.size}\n• Archived: $archivedCount • Trash: $trashedCount\n• Total Folders: ${folders.size}\n• Multi-Device Sync Protection: Active (Zero-Duplicate Merge)\n• Mode: ${
                             when {
                                 viewModel.isLocalGuestMode -> "Local Device Storage (No Sign-In)"
                                 preferences.simulateOfflineMode -> "Offline Mode Enabled"
@@ -2087,6 +2087,23 @@ fun WorkspaceScreen(
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+                    OutlinedButton(
+                        onClick = {
+                            viewModel.syncAndDeduplicateWorkspace(context = context, showFeedbackIfClean = true)
+                            showSyncDialog = false
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("sync_deduplicate_now_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.CloudSync,
+                            contentDescription = "Sync and deduplicate",
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Sync & Deduplicate Now")
+                    }
                 }
             },
             confirmButton = {

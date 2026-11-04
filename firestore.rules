@@ -80,7 +80,7 @@ service cloud.firestore {
       allow get: if isOwner(userId) &&
                     isValidId(userId) &&
                     isValidId(noteId) &&
-                    existing().userId == request.auth.uid;
+                    (resource == null || !('userId' in existing()) || existing().userId == request.auth.uid);
 
       allow list: if isOwner(userId) &&
                      existing().userId == request.auth.uid;
@@ -106,21 +106,21 @@ service cloud.firestore {
                        isValidId(userId) &&
                        isValidId(noteId) &&
                        isValidNote(incoming()) &&
-                       existing().userId == request.auth.uid &&
-                       incoming().userId == existing().userId &&
-                       incoming().createdAt == existing().createdAt &&
+                       (!('userId' in existing()) || existing().userId == request.auth.uid) &&
+                       incoming().userId == request.auth.uid &&
+                       (!('createdAt' in existing()) || existing().createdAt == null || incoming().createdAt == existing().createdAt) &&
                        incoming().diff(existing()).affectedKeys().hasOnly([
                          'title', 'content', 'folderId', 'category', 'tags', 'colorHex',
                          'isPinned', 'isArchived', 'isTrashed', 'trashedAtEpochMillis',
                          'isLocked', 'passwordHash', 'encryptedPayload',
                          'reminderEpochMillis', 'reminderLabel', 'versionHistory',
-                         'updatedAt'
+                         'updatedAt', 'pinned', 'archived', 'trashed', 'locked'
                        ]);
 
       allow delete: if isOwner(userId) &&
                        isValidId(userId) &&
                        isValidId(noteId) &&
-                       existing().userId == request.auth.uid;
+                       (resource == null || !('userId' in existing()) || existing().userId == request.auth.uid);
     }
 
     // 5. Per-User Categories Collection
@@ -128,7 +128,7 @@ service cloud.firestore {
       allow get: if isOwner(userId) &&
                     isValidId(userId) &&
                     isValidId(categoryId) &&
-                    existing().userId == request.auth.uid;
+                    (resource == null || !('userId' in existing()) || existing().userId == request.auth.uid);
 
       allow list: if isOwner(userId) &&
                      existing().userId == request.auth.uid;
@@ -144,15 +144,15 @@ service cloud.firestore {
                        isValidId(userId) &&
                        isValidId(categoryId) &&
                        isValidCategory(incoming()) &&
-                       existing().userId == request.auth.uid &&
-                       incoming().userId == existing().userId &&
-                       incoming().createdAt == existing().createdAt &&
+                       (!('userId' in existing()) || existing().userId == request.auth.uid) &&
+                       incoming().userId == request.auth.uid &&
+                       (!('createdAt' in existing()) || existing().createdAt == null || incoming().createdAt == existing().createdAt) &&
                        incoming().diff(existing()).affectedKeys().hasOnly(['name', 'colorHex']);
 
       allow delete: if isOwner(userId) &&
                        isValidId(userId) &&
                        isValidId(categoryId) &&
-                       existing().userId == request.auth.uid;
+                       (resource == null || !('userId' in existing()) || existing().userId == request.auth.uid);
     }
 
     // 6. Per-User Folders Collection
@@ -160,7 +160,7 @@ service cloud.firestore {
       allow get: if isOwner(userId) &&
                     isValidId(userId) &&
                     isValidId(folderId) &&
-                    existing().userId == request.auth.uid;
+                    (resource == null || !('userId' in existing()) || existing().userId == request.auth.uid);
 
       allow list: if isOwner(userId) &&
                      existing().userId == request.auth.uid;
@@ -180,9 +180,9 @@ service cloud.firestore {
                        isValidId(userId) &&
                        isValidId(folderId) &&
                        isValidFolder(incoming()) &&
-                       existing().userId == request.auth.uid &&
-                       incoming().userId == existing().userId &&
-                       incoming().createdAt == existing().createdAt &&
+                       (!('userId' in existing()) || existing().userId == request.auth.uid) &&
+                       incoming().userId == request.auth.uid &&
+                       (!('createdAt' in existing()) || existing().createdAt == null || incoming().createdAt == existing().createdAt) &&
                        incoming().diff(existing()).affectedKeys().hasOnly([
                          'name', 'parentFolderId', 'colorHex', 'updatedAt'
                        ]);
@@ -190,7 +190,7 @@ service cloud.firestore {
       allow delete: if isOwner(userId) &&
                        isValidId(userId) &&
                        isValidId(folderId) &&
-                       existing().userId == request.auth.uid;
+                       (resource == null || !('userId' in existing()) || existing().userId == request.auth.uid);
     }
   }
 }

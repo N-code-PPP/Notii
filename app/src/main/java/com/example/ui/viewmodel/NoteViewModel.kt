@@ -21,6 +21,7 @@ import com.example.data.model.NoteVersionEntry
 import com.example.data.preferences.UserPreferences
 import com.example.data.preferences.UserPreferencesRepository
 import com.example.data.repository.NoteRepository
+import com.example.data.util.NoteSyncDeduplicator
 import com.example.data.util.NoteVaultCrypto
 import com.example.notification.ReminderNotificationHelper
 import com.example.widget.NoteAppWidgetProvider
@@ -34,6 +35,8 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 sealed interface UiState<out T> {
     data object Loading : UiState<Nothing>
@@ -149,46 +152,132 @@ class NoteViewModel(
     private val _pinnedNotificationNotes = MutableStateFlow<Set<String>>(emptySet())
     val pinnedNotificationNotes: StateFlow<Set<String>> = _pinnedNotificationNotes.asStateFlow()
 
+    private val _isSyncingWorkspace = MutableStateFlow(false)
+    val isSyncingWorkspace: StateFlow<Boolean> = _isSyncingWorkspace.asStateFlow()
+
+    private val inFlightSaveKeys = mutableSetOf<String>()
+
     init {
         if (!isLocalGuestMode) {
-            migrateLocalGuestDataToCloudIfNeeded()
+            viewModelScope.launch {
+                syncMigrationMutex.withLock {
+                    _isSyncingWorkspace.value = true
+                    try {
+                        migrateLocalGuestDataToCloudInternal()
+                        reconcileCloudDuplicatesInternal(context = null, showFeedbackIfClean = false)
+                    } finally {
+                        _isSyncingWorkspace.value = false
+                    }
+                }
+            }
         }
     }
 
-    private fun migrateLocalGuestDataToCloudIfNeeded() {
+    fun syncAndDeduplicateWorkspace(context: Context? = null, showFeedbackIfClean: Boolean = true) {
+        if (isLocalGuestMode) {
+            val currentNotes = localStore.notesSnapshotFlow.value.notes
+            val dedupedNotes = NoteSyncDeduplicator.deduplicateNotesForDisplay(currentNotes)
+            val removedCount = (currentNotes.size - dedupedNotes.size).coerceAtLeast(0)
+            if (removedCount > 0) {
+                val keepIds = dedupedNotes.map { it.id }.toSet()
+                val dropIds = currentNotes.map { it.id }.filterNot { keepIds.contains(it) }.toSet()
+                localStore.deleteNotesBatch(dropIds)
+                _statusBanner.value = "Cleaned up $removedCount duplicate local note(s)."
+            } else if (showFeedbackIfClean) {
+                _statusBanner.value = "Local workspace verified • Zero duplicate notes found."
+            }
+            return
+        }
+
+        viewModelScope.launch {
+            syncMigrationMutex.withLock {
+                _isSyncingWorkspace.value = true
+                try {
+                    migrateLocalGuestDataToCloudInternal()
+                    reconcileCloudDuplicatesInternal(context = context, showFeedbackIfClean = showFeedbackIfClean)
+                } finally {
+                    _isSyncingWorkspace.value = false
+                }
+            }
+        }
+    }
+
+    private suspend fun migrateLocalGuestDataToCloudInternal() {
         val localNotes = localStore.notesSnapshotFlow.value.notes
         val localFolders = localStore.foldersFlow.value
         val localCategories = localStore.categoriesFlow.value
         if (localNotes.isEmpty() && localFolders.isEmpty() && localCategories.isEmpty()) return
 
-        viewModelScope.launch {
-            try {
-                // 1. Migrate custom categories
-                localCategories.forEach { cat ->
-                    repository.createCategory(cat.name, cat.colorHex).onSuccess {
+        try {
+            val existingCloudCategories = repository.getUserCategories(currentUserId).getOrDefault(emptyList())
+            val existingCloudFolders = repository.getUserFolders(currentUserId).getOrDefault(emptyList()).toMutableList()
+            val existingCloudNotes = repository.getUserNotes(currentUserId).getOrDefault(emptyList()).toMutableList()
+
+            // 1. Migrate custom categories without creating duplicates
+            localCategories.forEach { cat ->
+                val cleanName = cat.name.trim()
+                val matchingCloudCat = existingCloudCategories.firstOrNull {
+                    it.name.trim().equals(cleanName, ignoreCase = true)
+                }
+                if (matchingCloudCat != null) {
+                    localStore.deleteCategory(cat.id)
+                } else {
+                    val deterministicCatId = NoteSyncDeduplicator.deterministicCategoryId(cleanName)
+                    repository.createCategory(
+                        name = cleanName,
+                        colorHex = cat.colorHex,
+                        preferredId = deterministicCatId
+                    ).onSuccess {
                         localStore.deleteCategory(cat.id)
                     }
                 }
+            }
 
-                // 2. Migrate folders (root folders first, then nested folders, mapping old IDs to new cloud IDs)
-                val folderIdMap = mutableMapOf<String, String>()
-                val remainingFolders = localFolders.toMutableList()
-                var progress = true
-                while (remainingFolders.isNotEmpty() && progress) {
-                    progress = false
-                    val iterator = remainingFolders.iterator()
-                    while (iterator.hasNext()) {
-                        val folder = iterator.next()
-                        val parentReady = folder.parentFolderId.isBlank() || folderIdMap.containsKey(folder.parentFolderId)
-                        if (parentReady) {
-                            val mappedParentId = if (folder.parentFolderId.isBlank()) "" else folderIdMap[folder.parentFolderId].orEmpty()
+            // 2. Migrate folders (root folders first, then nested folders), reusing matching cloud folders
+            val folderIdMap = mutableMapOf<String, String>()
+            val remainingFolders = localFolders.toMutableList()
+            var progress = true
+            while (remainingFolders.isNotEmpty() && progress) {
+                progress = false
+                val iterator = remainingFolders.iterator()
+                while (iterator.hasNext()) {
+                    val folder = iterator.next()
+                    val parentReady = folder.parentFolderId.isBlank() || folderIdMap.containsKey(folder.parentFolderId)
+                    if (parentReady) {
+                        val mappedParentId = if (folder.parentFolderId.isBlank()) {
+                            ""
+                        } else {
+                            folderIdMap[folder.parentFolderId].orEmpty()
+                        }
+                        val existingMatch = existingCloudFolders.firstOrNull {
+                            it.parentFolderId.trim() == mappedParentId.trim() &&
+                                it.name.trim().equals(folder.name.trim(), ignoreCase = true)
+                        }
+                        if (existingMatch != null) {
+                            folderIdMap[folder.id] = existingMatch.id
+                            localStore.deleteFolder(folder.id)
+                            iterator.remove()
+                            progress = true
+                        } else {
+                            val deterministicFolderId = NoteSyncDeduplicator.deterministicFolderId(
+                                name = folder.name,
+                                parentFolderId = mappedParentId
+                            )
                             val createRes = repository.createFolder(
                                 name = folder.name,
                                 parentFolderId = mappedParentId,
-                                colorHex = folder.colorHex
+                                colorHex = folder.colorHex,
+                                preferredId = deterministicFolderId
                             )
                             createRes.onSuccess { cloudFolderId ->
                                 folderIdMap[folder.id] = cloudFolderId
+                                existingCloudFolders.add(
+                                    folder.copy(
+                                        id = cloudFolderId,
+                                        userId = currentUserId,
+                                        parentFolderId = mappedParentId
+                                    )
+                                )
                                 localStore.deleteFolder(folder.id)
                                 iterator.remove()
                                 progress = true
@@ -196,15 +285,42 @@ class NoteViewModel(
                         }
                     }
                 }
+            }
 
-                // 3. Migrate notes with mapped folder IDs
-                var migratedNotesCount = 0
-                localNotes.forEach { note ->
-                    val mappedFolderId = if (note.folderId.isBlank()) {
-                        ""
-                    } else {
-                        folderIdMap[note.folderId] ?: ""
+            // 3. Migrate notes with mapped folder IDs & content fingerprint deduplication
+            var migratedNotesCount = 0
+            localNotes.forEach { note ->
+                val mappedFolderId = if (note.folderId.isBlank()) {
+                    ""
+                } else {
+                    folderIdMap[note.folderId] ?: note.folderId
+                }
+                val deterministicId = NoteSyncDeduplicator.deterministicNoteId(note, mappedFolderId)
+                val localSig = NoteSyncDeduplicator.noteContentSignature(note, mappedFolderId)
+
+                val matchingCloudNote = existingCloudNotes.firstOrNull { cloudNote ->
+                    cloudNote.id == note.id ||
+                        cloudNote.id == deterministicId ||
+                        (localSig.isNotEmpty() && NoteSyncDeduplicator.noteContentSignature(cloudNote) == localSig)
+                }
+
+                if (matchingCloudNote != null) {
+                    val localTs = NoteSyncDeduplicator.noteTimestampMillis(note)
+                    val cloudTs = NoteSyncDeduplicator.noteTimestampMillis(matchingCloudNote)
+                    if (localTs > cloudTs) {
+                        val merged = NoteSyncDeduplicator.mergeDuplicateNotesIntoWinner(
+                            winner = note.copy(
+                                id = matchingCloudNote.id,
+                                userId = currentUserId,
+                                folderId = mappedFolderId,
+                                createdAt = matchingCloudNote.createdAt ?: note.createdAt
+                            ),
+                            duplicates = listOf(matchingCloudNote)
+                        )
+                        repository.updateNote(merged)
                     }
+                    localStore.deleteNote(note.id)
+                } else {
                     val createRes = repository.createNote(
                         title = note.title,
                         content = note.content,
@@ -221,19 +337,93 @@ class NoteViewModel(
                         encryptedPayload = note.encryptedPayload,
                         reminderEpochMillis = note.reminderEpochMillis,
                         reminderLabel = note.reminderLabel,
-                        versionHistory = note.versionHistory
+                        versionHistory = note.versionHistory,
+                        preferredId = deterministicId
                     )
-                    createRes.onSuccess {
+                    createRes.onSuccess { cloudNoteId ->
+                        existingCloudNotes.add(
+                            note.copy(
+                                id = cloudNoteId,
+                                userId = currentUserId,
+                                folderId = mappedFolderId
+                            )
+                        )
                         localStore.deleteNote(note.id)
                         migratedNotesCount++
                     }
                 }
+            }
 
-                if (migratedNotesCount > 0 || folderIdMap.isNotEmpty()) {
-                    _statusBanner.value = "Synced $migratedNotesCount local note(s) and ${folderIdMap.size} folder(s) to your Google Cloud account."
+            if (migratedNotesCount > 0) {
+                _statusBanner.value = "Synced $migratedNotesCount local note(s) to your Google Cloud account without duplicates."
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to migrate local guest data to cloud", e)
+        }
+    }
+
+    private suspend fun reconcileCloudDuplicatesInternal(
+        context: Context?,
+        showFeedbackIfClean: Boolean
+    ) {
+        try {
+            val cloudNotes = repository.getUserNotes(currentUserId).getOrNull() ?: return
+            val cloudFolders = repository.getUserFolders(currentUserId).getOrNull() ?: emptyList()
+            val cloudCategories = repository.getUserCategories(currentUserId).getOrNull() ?: emptyList()
+
+            val plan = NoteSyncDeduplicator.planCloudDeduplication(
+                notes = cloudNotes,
+                folders = cloudFolders,
+                categories = cloudCategories
+            )
+
+            if (!plan.hasChanges) {
+                if (showFeedbackIfClean) {
+                    _statusBanner.value = "Multi-device sync verified • All notes and folders are in sync with zero duplicates."
                 }
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to migrate local guest data to cloud", e)
+                return
+            }
+
+            if (context != null && plan.photoNoteIdRemap.isNotEmpty()) {
+                val vaultStore = PrivateDocumentVaultStore.getInstance(context)
+                plan.photoNoteIdRemap.forEach { (oldNoteId, winnerNoteId) ->
+                    vaultStore.relinkPhotosFromOldNoteToNewNote(oldNoteId, winnerNoteId)
+                }
+            }
+
+            plan.childFoldersToReparent.forEach { folder ->
+                repository.updateFolder(folder)
+            }
+            plan.notesToUpdate.forEach { note ->
+                repository.updateNote(note)
+            }
+            plan.duplicateNoteIdsToDelete.forEach { dupNoteId ->
+                repository.deleteNote(dupNoteId)
+            }
+            plan.duplicateFolderIdsToDelete.forEach { dupFolderId ->
+                repository.deleteFolder(dupFolderId)
+            }
+            plan.duplicateCategoryIdsToDelete.forEach { dupCategoryId ->
+                repository.deleteCategory(dupCategoryId)
+            }
+
+            val removedNotes = plan.duplicateNoteIdsToDelete.size
+            val removedFolders = plan.duplicateFolderIdsToDelete.size
+            if (removedNotes > 0 || removedFolders > 0) {
+                _statusBanner.value = buildString {
+                    append("Multi-device sync complete • Merged ")
+                    if (removedNotes > 0) append("$removedNotes duplicate note(s)")
+                    if (removedNotes > 0 && removedFolders > 0) append(" and ")
+                    if (removedFolders > 0) append("$removedFolders duplicate folder(s)")
+                    append(".")
+                }
+            } else if (showFeedbackIfClean) {
+                _statusBanner.value = "Multi-device sync complete • Workspace is clean and up to date."
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to reconcile multi-device cloud duplicates", e)
+            if (showFeedbackIfClean) {
+                _statusBanner.value = e.localizedMessage ?: "Failed to complete multi-device sync check"
             }
         }
     }
@@ -289,6 +479,7 @@ class NoteViewModel(
                 category = finalCategory
             ).toSerializedString()
 
+            val preferredCameraNoteId = "cam_note_${NoteSyncDeduplicator.sanitizeDocumentId(keptPhotos.first().id).take(32)}"
             val res = if (isLocalGuestMode) {
                 localStore.createNote(
                     title = finalTitle,
@@ -304,7 +495,8 @@ class NoteViewModel(
                     encryptedPayload = "",
                     reminderEpochMillis = 0L,
                     reminderLabel = "",
-                    versionHistory = listOf(initialVersion)
+                    versionHistory = listOf(initialVersion),
+                    preferredId = preferredCameraNoteId
                 )
             } else {
                 repository.createNote(
@@ -321,7 +513,8 @@ class NoteViewModel(
                     encryptedPayload = "",
                     reminderEpochMillis = 0L,
                     reminderLabel = "",
-                    versionHistory = listOf(initialVersion)
+                    versionHistory = listOf(initialVersion),
+                    preferredId = preferredCameraNoteId
                 )
             }
 
@@ -425,169 +618,189 @@ class NoteViewModel(
         pushPermanentNotification: Boolean = false,
         onComplete: (Boolean) -> Unit = {}
     ) {
+        val saveKey = existingNote?.id?.takeIf { it.isNotBlank() }
+            ?: draftNoteId.ifBlank { "${title.trim()}|${plainContent.trim()}" }
+        synchronized(inFlightSaveKeys) {
+            if (!inFlightSaveKeys.add(saveKey)) {
+                return
+            }
+        }
+
         viewModelScope.launch {
-            val passwordHash: String
-            val encryptedPayload: String
-            val storedContent: String
-            var activePasswordForSession = newPassword
+            try {
+                val passwordHash: String
+                val encryptedPayload: String
+                val storedContent: String
+                var activePasswordForSession = newPassword
 
-            if (isLocked) {
-                if (newPassword.isNotBlank()) {
-                    passwordHash = NoteVaultCrypto.hashPassword(newPassword)
-                    encryptedPayload = NoteVaultCrypto.encryptContent(plainContent, newPassword)
-                    storedContent = "[Encrypted Vault Note]"
-                    preferencesRepository.setMasterVaultPasswordHash(passwordHash)
-                } else if (existingNote != null && existingNote.isLocked && existingNote.passwordHash.isNotBlank()) {
-                    passwordHash = existingNote.passwordHash
-                    val sessionPassword = _unlockedNotePasswords.value[existingNote.id]
-                        ?.takeIf { it.isNotBlank() }
-                        ?: NoteVaultCrypto.MASTER_PASSWORD
-                    activePasswordForSession = sessionPassword
-                    encryptedPayload = NoteVaultCrypto.encryptContent(plainContent, sessionPassword)
-                    storedContent = "[Encrypted Vault Note]"
-                } else {
-                    val masterPwd = NoteVaultCrypto.MASTER_PASSWORD
-                    activePasswordForSession = masterPwd
-                    passwordHash = NoteVaultCrypto.hashPassword(masterPwd)
-                    encryptedPayload = NoteVaultCrypto.encryptContent(plainContent, masterPwd)
-                    storedContent = "[Encrypted Vault Note]"
-                    preferencesRepository.setMasterVaultPasswordHash(passwordHash)
-                }
-            } else {
-                passwordHash = ""
-                encryptedPayload = ""
-                storedContent = plainContent
-            }
-
-            val finalTitle = title.trim()
-            val finalCategory = category.ifBlank { "General" }
-
-            val result = if (existingNote == null || existingNote.id.isBlank()) {
-                val initialVersion = NoteVersionEntry(
-                    savedAtMillis = System.currentTimeMillis(),
-                    title = finalTitle,
-                    content = storedContent,
-                    category = finalCategory
-                ).toSerializedString()
-
-                if (isLocalGuestMode) {
-                    localStore.createNote(
-                        title = finalTitle,
-                        content = storedContent,
-                        folderId = folderId,
-                        category = finalCategory,
-                        tags = tags,
-                        colorHex = colorHex,
-                        isPinned = isPinned,
-                        isArchived = isArchived,
-                        isLocked = isLocked,
-                        passwordHash = passwordHash,
-                        encryptedPayload = encryptedPayload,
-                        reminderEpochMillis = reminderEpochMillis,
-                        reminderLabel = reminderLabel,
-                        versionHistory = listOf(initialVersion)
-                    )
-                } else {
-                    repository.createNote(
-                        title = finalTitle,
-                        content = storedContent,
-                        folderId = folderId,
-                        category = finalCategory,
-                        tags = tags,
-                        colorHex = colorHex,
-                        isPinned = isPinned,
-                        isArchived = isArchived,
-                        isLocked = isLocked,
-                        passwordHash = passwordHash,
-                        encryptedPayload = encryptedPayload,
-                        reminderEpochMillis = reminderEpochMillis,
-                        reminderLabel = reminderLabel,
-                        versionHistory = listOf(initialVersion)
-                    )
-                }
-            } else {
-                val updatedHistory = appendVersionSnapshotIfNeeded(
-                    existingNote = existingNote,
-                    newTitle = finalTitle,
-                    newStoredContent = storedContent,
-                    newCategory = finalCategory
-                )
-
-                val updated = existingNote.copy(
-                    title = finalTitle,
-                    content = storedContent,
-                    folderId = folderId,
-                    category = finalCategory,
-                    tags = tags,
-                    colorHex = colorHex,
-                    isPinned = isPinned,
-                    isArchived = isArchived,
-                    isLocked = isLocked,
-                    passwordHash = passwordHash,
-                    encryptedPayload = encryptedPayload,
-                    reminderEpochMillis = reminderEpochMillis,
-                    reminderLabel = reminderLabel,
-                    versionHistory = updatedHistory
-                )
-                if (isLocalGuestMode) {
-                    localStore.updateNote(updated).map { existingNote.id }
-                } else {
-                    repository.updateNote(updated).map { existingNote.id }
-                }
-            }
-
-            result.onSuccess { noteId ->
-                if ((existingNote == null || existingNote.id.isBlank()) && draftNoteId.isNotBlank() && draftNoteId != noteId) {
-                    PrivateDocumentVaultStore.getInstance(context)
-                        .relinkPhotosFromOldNoteToNewNote(draftNoteId, noteId)
-                }
                 if (isLocked) {
-                    _unlockedNotes.value = _unlockedNotes.value + (noteId to plainContent)
-                    if (activePasswordForSession.isNotBlank()) {
-                        _unlockedNotePasswords.value = _unlockedNotePasswords.value + (noteId to activePasswordForSession)
+                    if (newPassword.isNotBlank()) {
+                        passwordHash = NoteVaultCrypto.hashPassword(newPassword)
+                        encryptedPayload = NoteVaultCrypto.encryptContent(plainContent, newPassword)
+                        storedContent = "[Encrypted Vault Note]"
+                        preferencesRepository.setMasterVaultPasswordHash(passwordHash)
+                    } else if (existingNote != null && existingNote.isLocked && existingNote.passwordHash.isNotBlank()) {
+                        passwordHash = existingNote.passwordHash
+                        val sessionPassword = _unlockedNotePasswords.value[existingNote.id]
+                            ?.takeIf { it.isNotBlank() }
+                            ?: NoteVaultCrypto.MASTER_PASSWORD
+                        activePasswordForSession = sessionPassword
+                        encryptedPayload = NoteVaultCrypto.encryptContent(plainContent, sessionPassword)
+                        storedContent = "[Encrypted Vault Note]"
+                    } else {
+                        val masterPwd = NoteVaultCrypto.MASTER_PASSWORD
+                        activePasswordForSession = masterPwd
+                        passwordHash = NoteVaultCrypto.hashPassword(masterPwd)
+                        encryptedPayload = NoteVaultCrypto.encryptContent(plainContent, masterPwd)
+                        storedContent = "[Encrypted Vault Note]"
+                        preferencesRepository.setMasterVaultPasswordHash(passwordHash)
                     }
                 } else {
-                    _unlockedNotes.value = _unlockedNotes.value - noteId
-                    _unlockedNotePasswords.value = _unlockedNotePasswords.value - noteId
+                    passwordHash = ""
+                    encryptedPayload = ""
+                    storedContent = plainContent
                 }
-                if (reminderEpochMillis > System.currentTimeMillis() && !isArchived) {
-                    ReminderNotificationHelper.scheduleNoteReminder(
-                        context = context,
-                        noteId = noteId,
-                        noteTitle = finalTitle,
-                        reminderLabel = reminderLabel.ifBlank { if (!isLocked) plainContent.trim() else "" },
-                        isLocked = isLocked,
-                        triggerAtMillis = reminderEpochMillis
-                    )
-                } else if (existingNote != null && (reminderEpochMillis == 0L || isArchived)) {
-                    ReminderNotificationHelper.cancelNoteReminder(context, noteId)
-                }
-                if (pushPermanentNotification) {
-                    if (draftNoteId.isNotBlank() && draftNoteId != noteId) {
-                        ReminderNotificationHelper.cancelPermanentNoteNotification(context, draftNoteId)
+
+                val finalTitle = title.trim()
+                val finalCategory = category.ifBlank { "General" }
+                val preferredCreateId = NoteSyncDeduplicator.deterministicDraftCloudId(draftNoteId)
+                val currentNotes = (notesState.value as? UiState.Success)?.data?.notes.orEmpty()
+                val resolvedExistingNote = existingNote?.takeIf { it.id.isNotBlank() }
+                    ?: currentNotes.firstOrNull { preferredCreateId.isNotBlank() && it.id == preferredCreateId }
+
+                val result = if (resolvedExistingNote == null) {
+                    val initialVersion = NoteVersionEntry(
+                        savedAtMillis = System.currentTimeMillis(),
+                        title = finalTitle,
+                        content = storedContent,
+                        category = finalCategory
+                    ).toSerializedString()
+
+                    if (isLocalGuestMode) {
+                        localStore.createNote(
+                            title = finalTitle,
+                            content = storedContent,
+                            folderId = folderId,
+                            category = finalCategory,
+                            tags = tags,
+                            colorHex = colorHex,
+                            isPinned = isPinned,
+                            isArchived = isArchived,
+                            isLocked = isLocked,
+                            passwordHash = passwordHash,
+                            encryptedPayload = encryptedPayload,
+                            reminderEpochMillis = reminderEpochMillis,
+                            reminderLabel = reminderLabel,
+                            versionHistory = listOf(initialVersion),
+                            preferredId = preferredCreateId
+                        )
+                    } else {
+                        repository.createNote(
+                            title = finalTitle,
+                            content = storedContent,
+                            folderId = folderId,
+                            category = finalCategory,
+                            tags = tags,
+                            colorHex = colorHex,
+                            isPinned = isPinned,
+                            isArchived = isArchived,
+                            isLocked = isLocked,
+                            passwordHash = passwordHash,
+                            encryptedPayload = encryptedPayload,
+                            reminderEpochMillis = reminderEpochMillis,
+                            reminderLabel = reminderLabel,
+                            versionHistory = listOf(initialVersion),
+                            preferredId = preferredCreateId
+                        )
                     }
-                    ReminderNotificationHelper.showPermanentNoteNotification(
-                        context = context,
-                        noteId = noteId,
-                        noteTitle = finalTitle,
-                        noteContent = plainContent,
-                        isLocked = false
+                } else {
+                    val updatedHistory = appendVersionSnapshotIfNeeded(
+                        existingNote = resolvedExistingNote,
+                        newTitle = finalTitle,
+                        newStoredContent = storedContent,
+                        newCategory = finalCategory
                     )
-                    _pinnedNotificationNotes.value = _pinnedNotificationNotes.value + noteId
-                    val noteLabel = finalTitle.ifBlank { "Note" }
-                    _statusUndoNote.value = null
-                    _statusBanner.value = "Saved & pinned permanent notification for “$noteLabel”."
+
+                    val updated = resolvedExistingNote.copy(
+                        title = finalTitle,
+                        content = storedContent,
+                        folderId = folderId,
+                        category = finalCategory,
+                        tags = tags,
+                        colorHex = colorHex,
+                        isPinned = isPinned,
+                        isArchived = isArchived,
+                        isLocked = isLocked,
+                        passwordHash = passwordHash,
+                        encryptedPayload = encryptedPayload,
+                        reminderEpochMillis = reminderEpochMillis,
+                        reminderLabel = reminderLabel,
+                        versionHistory = updatedHistory
+                    )
+                    if (isLocalGuestMode) {
+                        localStore.updateNote(updated).map { resolvedExistingNote.id }
+                    } else {
+                        repository.updateNote(updated).map { resolvedExistingNote.id }
+                    }
                 }
-                onComplete(true)
-            }.onFailure { err ->
-                _statusBanner.value = err.localizedMessage ?: "Failed to save note"
-                onComplete(false)
+
+                result.onSuccess { noteId ->
+                    if ((existingNote == null || existingNote.id.isBlank()) && draftNoteId.isNotBlank() && draftNoteId != noteId) {
+                        PrivateDocumentVaultStore.getInstance(context)
+                            .relinkPhotosFromOldNoteToNewNote(draftNoteId, noteId)
+                    }
+                    if (isLocked) {
+                        _unlockedNotes.value = _unlockedNotes.value + (noteId to plainContent)
+                        if (activePasswordForSession.isNotBlank()) {
+                            _unlockedNotePasswords.value = _unlockedNotePasswords.value + (noteId to activePasswordForSession)
+                        }
+                    } else {
+                        _unlockedNotes.value = _unlockedNotes.value - noteId
+                        _unlockedNotePasswords.value = _unlockedNotePasswords.value - noteId
+                    }
+                    if (reminderEpochMillis > System.currentTimeMillis() && !isArchived) {
+                        ReminderNotificationHelper.scheduleNoteReminder(
+                            context = context,
+                            noteId = noteId,
+                            noteTitle = finalTitle,
+                            reminderLabel = reminderLabel.ifBlank { if (!isLocked) plainContent.trim() else "" },
+                            isLocked = isLocked,
+                            triggerAtMillis = reminderEpochMillis
+                        )
+                    } else if (resolvedExistingNote != null && (reminderEpochMillis == 0L || isArchived)) {
+                        ReminderNotificationHelper.cancelNoteReminder(context, noteId)
+                    }
+                    if (pushPermanentNotification) {
+                        if (draftNoteId.isNotBlank() && draftNoteId != noteId) {
+                            ReminderNotificationHelper.cancelPermanentNoteNotification(context, draftNoteId)
+                        }
+                        ReminderNotificationHelper.showPermanentNoteNotification(
+                            context = context,
+                            noteId = noteId,
+                            noteTitle = finalTitle,
+                            noteContent = plainContent,
+                            isLocked = false
+                        )
+                        _pinnedNotificationNotes.value = _pinnedNotificationNotes.value + noteId
+                        val noteLabel = finalTitle.ifBlank { "Note" }
+                        _statusUndoNote.value = null
+                        _statusBanner.value = "Saved & pinned permanent notification for “$noteLabel”."
+                    }
+                    onComplete(true)
+                }.onFailure { err ->
+                    _statusBanner.value = err.localizedMessage ?: "Failed to save note"
+                    onComplete(false)
+                }
+            } finally {
+                synchronized(inFlightSaveKeys) {
+                    inFlightSaveKeys.remove(saveKey)
+                }
             }
         }
     }
 
     fun assignNoteToFolder(note: Note, targetFolderId: String) {
-        if (note.id.isBlank() || note.createdAt == null) return
+        if (note.id.isBlank()) return
         viewModelScope.launch {
             val updated = note.copy(folderId = targetFolderId)
             val res = if (isLocalGuestMode) localStore.updateNote(updated) else repository.updateNote(updated)
@@ -598,7 +811,7 @@ class NoteViewModel(
     }
 
     fun togglePin(note: Note) {
-        if (note.id.isBlank() || note.createdAt == null) return
+        if (note.id.isBlank()) return
         viewModelScope.launch {
             val nextPinned = !note.isPinned
             val updated = note.copy(isPinned = nextPinned)
@@ -668,7 +881,7 @@ class NoteViewModel(
     }
 
     fun toggleArchive(note: Note) {
-        if (note.id.isBlank() || note.createdAt == null) return
+        if (note.id.isBlank()) return
         viewModelScope.launch {
             val nextArchived = !note.isArchived
             val updated = note.copy(
@@ -693,9 +906,8 @@ class NoteViewModel(
     }
 
     fun moveToTrash(context: Context, note: Note) {
-        if (note.id.isBlank() || note.createdAt == null) return
+        if (note.id.isBlank()) return
         viewModelScope.launch {
-            ReminderNotificationHelper.cancelNoteReminder(context, note.id)
             val updated = note.copy(
                 isTrashed = true,
                 trashedAtEpochMillis = System.currentTimeMillis(),
@@ -704,6 +916,9 @@ class NoteViewModel(
             )
             val res = if (isLocalGuestMode) localStore.updateNote(updated) else repository.updateNote(updated)
             res.onSuccess {
+                ReminderNotificationHelper.cancelNoteReminder(context, note.id)
+                ReminderNotificationHelper.cancelPermanentNoteNotification(context, note.id)
+                _pinnedNotificationNotes.value = _pinnedNotificationNotes.value - note.id
                 _statusBanner.value = "“${note.title.ifBlank { "Note" }}” moved to Trash. Filter by 'Trash' to restore or delete forever."
             }.onFailure { err ->
                 _statusBanner.value = err.localizedMessage ?: "Failed to move note to Trash"
@@ -712,7 +927,7 @@ class NoteViewModel(
     }
 
     fun restoreFromTrash(note: Note) {
-        if (note.id.isBlank() || note.createdAt == null) return
+        if (note.id.isBlank()) return
         viewModelScope.launch {
             val updated = note.copy(
                 isTrashed = false,
@@ -731,8 +946,14 @@ class NoteViewModel(
         if (noteId.isBlank()) return
         viewModelScope.launch {
             ReminderNotificationHelper.cancelNoteReminder(context, noteId)
+            ReminderNotificationHelper.cancelPermanentNoteNotification(context, noteId)
+            _pinnedNotificationNotes.value = _pinnedNotificationNotes.value - noteId
             val res = if (isLocalGuestMode) localStore.deleteNote(noteId) else repository.deleteNote(noteId)
-            res.onFailure { err ->
+            res.onSuccess {
+                PrivateDocumentVaultStore.getInstance(context).deleteNotePhotos(noteId)
+                _statusUndoNote.value = null
+                _statusBanner.value = "Note permanently deleted."
+            }.onFailure { err ->
                 _statusBanner.value = err.localizedMessage ?: "Failed to permanently delete note"
             }
         }
@@ -754,9 +975,13 @@ class NoteViewModel(
             .filter { it.isTrashed }
         if (trashedNotes.isEmpty()) return
         viewModelScope.launch {
+            val vaultStore = PrivateDocumentVaultStore.getInstance(context)
             trashedNotes.forEach { note ->
                 ReminderNotificationHelper.cancelNoteReminder(context, note.id)
+                ReminderNotificationHelper.cancelPermanentNoteNotification(context, note.id)
+                vaultStore.deleteNotePhotos(note.id)
             }
+            _pinnedNotificationNotes.value = _pinnedNotificationNotes.value - trashedNotes.map { it.id }.toSet()
             if (isLocalGuestMode) {
                 localStore.deleteNotesBatch(trashedNotes.map { it.id }.toSet())
             } else {
@@ -769,7 +994,7 @@ class NoteViewModel(
     fun bulkMoveNotesToFolder(noteIds: Set<String>, targetFolderId: String) {
         if (noteIds.isEmpty()) return
         val currentNotes = (notesState.value as? UiState.Success)?.data?.notes.orEmpty()
-        val targets = currentNotes.filter { noteIds.contains(it.id) && it.createdAt != null }
+        val targets = currentNotes.filter { noteIds.contains(it.id) }
         if (targets.isEmpty()) return
         viewModelScope.launch {
             val updatedTargets = targets.map { it.copy(folderId = targetFolderId) }
@@ -792,7 +1017,7 @@ class NoteViewModel(
         val cleanCategory = targetCategory.trim()
         if (noteIds.isEmpty() || cleanCategory.isBlank()) return
         val currentNotes = (notesState.value as? UiState.Success)?.data?.notes.orEmpty()
-        val targets = currentNotes.filter { noteIds.contains(it.id) && it.createdAt != null }
+        val targets = currentNotes.filter { noteIds.contains(it.id) }
         if (targets.isEmpty()) return
         viewModelScope.launch {
             val updatedTargets = targets.map { it.copy(category = cleanCategory) }
@@ -809,7 +1034,7 @@ class NoteViewModel(
     fun bulkTogglePin(noteIds: Set<String>) {
         if (noteIds.isEmpty()) return
         val currentNotes = (notesState.value as? UiState.Success)?.data?.notes.orEmpty()
-        val targets = currentNotes.filter { noteIds.contains(it.id) && !it.isTrashed && !it.isArchived && it.createdAt != null }
+        val targets = currentNotes.filter { noteIds.contains(it.id) && !it.isTrashed && !it.isArchived }
         if (targets.isEmpty()) return
         val shouldPin = targets.any { !it.isPinned }
         viewModelScope.launch {
@@ -831,7 +1056,7 @@ class NoteViewModel(
     fun bulkArchiveNotes(noteIds: Set<String>, archive: Boolean) {
         if (noteIds.isEmpty()) return
         val currentNotes = (notesState.value as? UiState.Success)?.data?.notes.orEmpty()
-        val targets = currentNotes.filter { noteIds.contains(it.id) && !it.isTrashed && it.createdAt != null }
+        val targets = currentNotes.filter { noteIds.contains(it.id) && !it.isTrashed }
         if (targets.isEmpty()) return
         viewModelScope.launch {
             val updatedTargets = targets.map { note ->
@@ -859,7 +1084,7 @@ class NoteViewModel(
     fun bulkRestoreNotesFromTrash(noteIds: Set<String>) {
         if (noteIds.isEmpty()) return
         val currentNotes = (notesState.value as? UiState.Success)?.data?.notes.orEmpty()
-        val targets = currentNotes.filter { noteIds.contains(it.id) && it.isTrashed && it.createdAt != null }
+        val targets = currentNotes.filter { noteIds.contains(it.id) && it.isTrashed }
         if (targets.isEmpty()) return
         viewModelScope.launch {
             val updatedTargets = targets.map { it.copy(isTrashed = false, trashedAtEpochMillis = 0L) }
@@ -879,11 +1104,10 @@ class NoteViewModel(
         val targets = currentNotes.filter { noteIds.contains(it.id) }
         if (targets.isEmpty()) return
         val trashedTargets = targets.filter { it.isTrashed }
-        val activeTargets = targets.filter { !it.isTrashed && it.createdAt != null }
+        val activeTargets = targets.filter { !it.isTrashed }
         viewModelScope.launch {
             val now = System.currentTimeMillis()
             val updatedActive = activeTargets.map { note ->
-                ReminderNotificationHelper.cancelNoteReminder(context, note.id)
                 note.copy(
                     isTrashed = true,
                     trashedAtEpochMillis = now,
@@ -891,17 +1115,47 @@ class NoteViewModel(
                     isArchived = false
                 )
             }
+            var movedActiveCount = 0
+            var failedActiveError: String? = null
             if (updatedActive.isNotEmpty()) {
                 if (isLocalGuestMode) {
-                    localStore.updateNotesBatch(updatedActive)
+                    localStore.updateNotesBatch(updatedActive).onSuccess {
+                        movedActiveCount = updatedActive.size
+                        updatedActive.forEach { note ->
+                            ReminderNotificationHelper.cancelNoteReminder(context, note.id)
+                            ReminderNotificationHelper.cancelPermanentNoteNotification(context, note.id)
+                        }
+                        _pinnedNotificationNotes.value = _pinnedNotificationNotes.value - activeTargets.map { it.id }.toSet()
+                    }.onFailure { err ->
+                        failedActiveError = err.localizedMessage
+                    }
                 } else {
-                    updatedActive.forEach { repository.updateNote(it) }
+                    val succeededIds = mutableSetOf<String>()
+                    updatedActive.forEach { note ->
+                        repository.updateNote(note).onSuccess {
+                            movedActiveCount++
+                            succeededIds.add(note.id)
+                            ReminderNotificationHelper.cancelNoteReminder(context, note.id)
+                            ReminderNotificationHelper.cancelPermanentNoteNotification(context, note.id)
+                        }.onFailure { err ->
+                            if (failedActiveError == null) {
+                                failedActiveError = err.localizedMessage
+                            }
+                        }
+                    }
+                    if (succeededIds.isNotEmpty()) {
+                        _pinnedNotificationNotes.value = _pinnedNotificationNotes.value - succeededIds
+                    }
                 }
             }
             if (trashedTargets.isNotEmpty()) {
+                val vaultStore = PrivateDocumentVaultStore.getInstance(context)
                 trashedTargets.forEach { note ->
                     ReminderNotificationHelper.cancelNoteReminder(context, note.id)
+                    ReminderNotificationHelper.cancelPermanentNoteNotification(context, note.id)
+                    vaultStore.deleteNotePhotos(note.id)
                 }
+                _pinnedNotificationNotes.value = _pinnedNotificationNotes.value - trashedTargets.map { it.id }.toSet()
                 if (isLocalGuestMode) {
                     localStore.deleteNotesBatch(trashedTargets.map { it.id }.toSet())
                 } else {
@@ -910,12 +1164,14 @@ class NoteViewModel(
             }
             _statusUndoNote.value = null
             _statusBanner.value = when {
-                activeTargets.isNotEmpty() && trashedTargets.isNotEmpty() ->
-                    "Moved ${activeTargets.size} note(s) to Trash and permanently deleted ${trashedTargets.size} note(s)."
+                failedActiveError != null && movedActiveCount == 0 && trashedTargets.isEmpty() ->
+                    failedActiveError ?: "Failed to move selected note(s) to Trash"
+                movedActiveCount > 0 && trashedTargets.isNotEmpty() ->
+                    "Moved $movedActiveCount note(s) to Trash and permanently deleted ${trashedTargets.size} note(s)."
                 trashedTargets.isNotEmpty() ->
                     "Permanently deleted ${trashedTargets.size} note(s)."
                 else ->
-                    "Moved ${activeTargets.size} note(s) to Trash."
+                    "Moved $movedActiveCount note(s) to Trash."
             }
         }
     }
@@ -935,7 +1191,11 @@ class NoteViewModel(
                 val res = if (isLocalGuestMode) {
                     localStore.createCategory(clean, colorHex)
                 } else {
-                    repository.createCategory(clean, colorHex)
+                    repository.createCategory(
+                        name = clean,
+                        colorHex = colorHex,
+                        preferredId = NoteSyncDeduplicator.deterministicCategoryId(clean)
+                    )
                 }
                 res.onFailure { err ->
                     _statusBanner.value = err.localizedMessage ?: "Failed to create category"
@@ -1078,11 +1338,24 @@ class NoteViewModel(
     ) {
         val clean = name.trim()
         if (clean.isBlank()) return
+        val cleanParent = parentFolderId.trim()
+        val existingMatch = foldersState.value.firstOrNull {
+            it.parentFolderId.trim() == cleanParent && it.name.trim().equals(clean, ignoreCase = true)
+        }
+        if (existingMatch != null) {
+            onCreated(existingMatch.id)
+            return
+        }
         viewModelScope.launch {
             val res = if (isLocalGuestMode) {
-                localStore.createFolder(clean, parentFolderId, colorHex)
+                localStore.createFolder(clean, cleanParent, colorHex)
             } else {
-                repository.createFolder(clean, parentFolderId, colorHex)
+                repository.createFolder(
+                    name = clean,
+                    parentFolderId = cleanParent,
+                    colorHex = colorHex,
+                    preferredId = NoteSyncDeduplicator.deterministicFolderId(clean, cleanParent)
+                )
             }
             res.onSuccess { newId ->
                 onCreated(newId)
@@ -1163,6 +1436,7 @@ class NoteViewModel(
     companion object {
         private const val TAG = "NoteViewModel"
         private const val STOP_TIMEOUT_MILLIS = 5000L
+        private val syncMigrationMutex = Mutex()
 
         internal fun appendVersionSnapshotIfNeeded(
             existingNote: Note,

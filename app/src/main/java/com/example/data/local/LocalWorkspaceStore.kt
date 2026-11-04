@@ -49,12 +49,15 @@ class LocalWorkspaceStore(context: Context) {
         encryptedPayload: String = "",
         reminderEpochMillis: Long = 0L,
         reminderLabel: String = "",
-        versionHistory: List<String> = emptyList()
+        versionHistory: List<String> = emptyList(),
+        preferredId: String = ""
     ): Result<String> {
         val now = Timestamp(Date())
-        val noteId = "local_note_${UUID.randomUUID().toString().replace("-", "").take(16)}"
+        val noteId = preferredId.trim().takeIf { it.isNotBlank() }
+            ?: "local_note_${UUID.randomUUID().toString().replace("-", "").take(16)}"
         val boundedTags = tags.map { it.trim().take(40) }.filter { it.isNotEmpty() }.take(10)
         val boundedHistory = versionHistory.map { it.take(5000) }.take(10)
+        val existing = _notesSnapshotFlow.value.notes.find { it.id == noteId }
         val newNote = Note(
             id = noteId,
             userId = LOCAL_USER_ID,
@@ -74,10 +77,12 @@ class LocalWorkspaceStore(context: Context) {
             reminderEpochMillis = reminderEpochMillis.coerceAtLeast(0L),
             reminderLabel = reminderLabel.take(100),
             versionHistory = boundedHistory,
-            createdAt = now,
+            createdAt = existing?.createdAt ?: now,
             updatedAt = now
         )
-        val updatedList = sortNotes(_notesSnapshotFlow.value.notes + newNote)
+        val updatedList = sortNotes(
+            _notesSnapshotFlow.value.notes.filterNot { it.id == noteId } + newNote
+        )
         saveNotesToPrefs(updatedList)
         _notesSnapshotFlow.value = NoteSyncSnapshot(
             notes = updatedList,
@@ -175,13 +180,20 @@ class LocalWorkspaceStore(context: Context) {
         if (cleanName.isBlank()) {
             return Result.failure(IllegalArgumentException("Folder name cannot be blank"))
         }
+        val cleanParent = parentFolderId.trim().take(128)
+        val existingMatch = _foldersFlow.value.firstOrNull {
+            it.parentFolderId == cleanParent && it.name.equals(cleanName, ignoreCase = true)
+        }
+        if (existingMatch != null) {
+            return Result.success(existingMatch.id)
+        }
         val now = Timestamp(Date())
         val folderId = "local_folder_${UUID.randomUUID().toString().replace("-", "").take(16)}"
         val newFolder = Folder(
             id = folderId,
             userId = LOCAL_USER_ID,
             name = cleanName,
-            parentFolderId = parentFolderId.trim().take(128),
+            parentFolderId = cleanParent,
             colorHex = colorHex.ifBlank { "#F59E0B" }.take(20),
             createdAt = now,
             updatedAt = now
@@ -220,6 +232,12 @@ class LocalWorkspaceStore(context: Context) {
         val cleanName = name.trim().take(40)
         if (cleanName.isBlank()) {
             return Result.failure(IllegalArgumentException("Category name cannot be blank"))
+        }
+        val existingMatch = _categoriesFlow.value.firstOrNull {
+            it.name.equals(cleanName, ignoreCase = true)
+        }
+        if (existingMatch != null) {
+            return Result.success(existingMatch.id)
         }
         val now = Timestamp(Date())
         val categoryId = "local_cat_${UUID.randomUUID().toString().replace("-", "").take(16)}"

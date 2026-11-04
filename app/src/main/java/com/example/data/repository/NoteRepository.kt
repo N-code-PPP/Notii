@@ -6,6 +6,7 @@ import com.example.data.model.Category
 import com.example.data.model.Folder
 import com.example.data.model.Note
 import com.example.data.model.NoteSyncSnapshot
+import com.example.data.util.NoteSyncDeduplicator
 import com.example.data.util.OperationType
 import com.example.data.util.handleFirestoreError
 import com.google.firebase.Timestamp
@@ -36,18 +37,71 @@ class NoteRepository(
             ?: throw IllegalStateException("User must be signed in with Google before accessing Firestore.")
     }
 
+    private fun DocumentSnapshot.toNoteModel(): Note? {
+        if (!exists()) return null
+        val rawTags = (get("tags") as? List<*>)?.mapNotNull { it as? String } ?: emptyList()
+        val rawHistory = (get("versionHistory") as? List<*>)?.mapNotNull { it as? String } ?: emptyList()
+        val estimate = DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
+        return Note(
+            id = id,
+            userId = getString("userId") ?: "",
+            title = getString("title") ?: "",
+            content = getString("content") ?: "",
+            folderId = getString("folderId") ?: "",
+            category = getString("category")?.ifBlank { "General" } ?: "General",
+            tags = rawTags,
+            colorHex = getString("colorHex")?.ifBlank { "#1E293B" } ?: "#1E293B",
+            isPinned = getBoolean("isPinned") ?: getBoolean("pinned") ?: false,
+            isArchived = getBoolean("isArchived") ?: getBoolean("archived") ?: false,
+            isTrashed = getBoolean("isTrashed") ?: getBoolean("trashed") ?: false,
+            trashedAtEpochMillis = getLong("trashedAtEpochMillis") ?: 0L,
+            isLocked = getBoolean("isLocked") ?: getBoolean("locked") ?: false,
+            passwordHash = getString("passwordHash") ?: "",
+            encryptedPayload = getString("encryptedPayload") ?: "",
+            reminderEpochMillis = getLong("reminderEpochMillis") ?: 0L,
+            reminderLabel = getString("reminderLabel") ?: "",
+            versionHistory = rawHistory,
+            createdAt = getTimestamp("createdAt", estimate),
+            updatedAt = getTimestamp("updatedAt", estimate)
+        )
+    }
+
+    private fun DocumentSnapshot.toFolderModel(): Folder? {
+        if (!exists()) return null
+        val estimate = DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
+        return Folder(
+            id = id,
+            userId = getString("userId") ?: "",
+            name = getString("name") ?: "",
+            parentFolderId = getString("parentFolderId") ?: "",
+            colorHex = getString("colorHex")?.ifBlank { "#F59E0B" } ?: "#F59E0B",
+            createdAt = getTimestamp("createdAt", estimate),
+            updatedAt = getTimestamp("updatedAt", estimate)
+        )
+    }
+
+    private fun DocumentSnapshot.toCategoryModel(): Category? {
+        if (!exists()) return null
+        val estimate = DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
+        return Category(
+            id = id,
+            userId = getString("userId") ?: "",
+            name = getString("name") ?: "",
+            colorHex = getString("colorHex")?.ifBlank { "#F59E0B" } ?: "#F59E0B",
+            createdAt = getTimestamp("createdAt", estimate)
+        )
+    }
+
     fun observeNotesWithMetadata(userId: String = auth.currentUser?.uid ?: "unauthenticated"): Flow<NoteSyncSnapshot> {
         val path = "users/$userId/notes"
         return db.collection("users").document(userId).collection("notes")
             .whereEqualTo("userId", userId)
             .snapshots(MetadataChanges.INCLUDE)
             .map { snapshot ->
-                val notes = snapshot.documents.mapNotNull { doc ->
-                    doc.toObject(Note::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
-                }.sortedWith(
-                    compareByDescending<Note> { it.isPinned }
-                        .thenByDescending { (it.updatedAt ?: it.createdAt ?: Timestamp(0, 0)).seconds }
-                )
+                val rawNotes = snapshot.documents.mapNotNull { doc ->
+                    doc.toNoteModel()
+                }
+                val notes = NoteSyncDeduplicator.deduplicateNotesForDisplay(rawNotes)
                 NoteSyncSnapshot(
                     notes = notes,
                     hasPendingWrites = snapshot.metadata.hasPendingWrites(),
@@ -78,9 +132,10 @@ class NoteRepository(
             .whereEqualTo("userId", userId)
             .snapshots()
             .map { snapshot ->
-                snapshot.documents.mapNotNull { doc ->
-                    doc.toObject(Category::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
-                }.sortedBy { it.name.lowercase() }
+                val rawCategories = snapshot.documents.mapNotNull { doc ->
+                    doc.toCategoryModel()
+                }
+                NoteSyncDeduplicator.deduplicateCategoriesForDisplay(rawCategories)
             }
             .catch { error ->
                 val unwrapped = (error as? com.google.firebase.firestore.FirebaseFirestoreException)
@@ -103,9 +158,10 @@ class NoteRepository(
             .whereEqualTo("userId", userId)
             .snapshots()
             .map { snapshot ->
-                snapshot.documents.mapNotNull { doc ->
-                    doc.toObject(Folder::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
-                }.sortedBy { it.name.lowercase() }
+                val rawFolders = snapshot.documents.mapNotNull { doc ->
+                    doc.toFolderModel()
+                }
+                NoteSyncDeduplicator.deduplicateFoldersForDisplay(rawFolders)
             }
             .catch { error ->
                 val unwrapped = (error as? com.google.firebase.firestore.FirebaseFirestoreException)
@@ -130,9 +186,47 @@ class NoteRepository(
                 .get()
                 .await()
             val notes = snapshot.documents.mapNotNull {
-                it.toObject(Note::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
+                it.toNoteModel()
             }
             Result.success(notes)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.LIST, path)
+            Result.failure(e)
+        }
+    }
+
+    suspend fun getUserFolders(userId: String = requireUserId()): Result<List<Folder>> {
+        val path = "users/$userId/folders"
+        return try {
+            val snapshot = db.collection("users").document(userId).collection("folders")
+                .whereEqualTo("userId", userId)
+                .get()
+                .await()
+            val folders = snapshot.documents.mapNotNull {
+                it.toFolderModel()
+            }
+            Result.success(folders)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.LIST, path)
+            Result.failure(e)
+        }
+    }
+
+    suspend fun getUserCategories(userId: String = requireUserId()): Result<List<Category>> {
+        val path = "users/$userId/categories"
+        return try {
+            val snapshot = db.collection("users").document(userId).collection("categories")
+                .whereEqualTo("userId", userId)
+                .get()
+                .await()
+            val categories = snapshot.documents.mapNotNull {
+                it.toCategoryModel()
+            }
+            Result.success(categories)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -145,7 +239,7 @@ class NoteRepository(
         val docRef = db.collection("users").document(targetUserId).collection("notes").document(noteId)
         return try {
             val doc = docRef.get().await()
-            val note = doc.toObject(Note::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
+            val note = doc.toNoteModel()
                 ?: throw NoSuchElementException("Note not found: $noteId")
             Result.success(note)
         } catch (e: CancellationException) {
@@ -172,21 +266,26 @@ class NoteRepository(
         encryptedPayload: String = "",
         reminderEpochMillis: Long = 0L,
         reminderLabel: String = "",
-        versionHistory: List<String> = emptyList()
+        versionHistory: List<String> = emptyList(),
+        preferredId: String = ""
     ): Result<String> {
         val uid = requireUserId()
         val notesCol = db.collection("users").document(uid).collection("notes")
-        val docRef = notesCol.document()
+        val cleanPreferredId = NoteSyncDeduplicator.sanitizeDocumentId(preferredId)
+        val docRef = if (cleanPreferredId.isNotBlank()) {
+            notesCol.document(cleanPreferredId)
+        } else {
+            notesCol.document()
+        }
         val boundedTags = tags.map { it.trim().take(40) }.filter { it.isNotEmpty() }.take(10)
         val boundedHistory = versionHistory.map { it.take(5000) }.take(10)
-        val payload = mapOf(
-            "userId" to uid,
+        val basePayload = mapOf<String, Any>(
             "title" to title.take(200),
             "content" to content.take(20000),
             "folderId" to folderId.trim().take(128),
             "category" to category.ifBlank { "General" }.take(50),
             "tags" to boundedTags,
-            "colorHex" to colorHex.take(20),
+            "colorHex" to colorHex.ifBlank { "#1E293B" }.take(20),
             "isPinned" to isPinned,
             "isArchived" to isArchived,
             "isTrashed" to isTrashed,
@@ -197,11 +296,23 @@ class NoteRepository(
             "reminderEpochMillis" to reminderEpochMillis.coerceAtLeast(0L),
             "reminderLabel" to reminderLabel.take(100),
             "versionHistory" to boundedHistory,
-            "createdAt" to FieldValue.serverTimestamp(),
             "updatedAt" to FieldValue.serverTimestamp()
         )
+        val createPayload = basePayload + mapOf(
+            "userId" to uid,
+            "createdAt" to FieldValue.serverTimestamp()
+        )
         return try {
-            docRef.set(payload).await()
+            if (cleanPreferredId.isNotBlank()) {
+                val existingDoc = runCatching { docRef.get().await() }.getOrNull()
+                if (existingDoc != null && existingDoc.exists()) {
+                    docRef.update(basePayload).await()
+                } else {
+                    docRef.set(createPayload).await()
+                }
+            } else {
+                docRef.set(createPayload).await()
+            }
             Result.success(docRef.id)
         } catch (e: CancellationException) {
             throw e
@@ -214,28 +325,42 @@ class NoteRepository(
     suspend fun updateNote(note: Note): Result<Unit> {
         val uid = requireUserId()
         require(note.id.isNotBlank()) { "Note ID must not be blank for update" }
-        requireNotNull(note.createdAt) { "Note createdAt must not be null for update" }
         val docRef = db.collection("users").document(uid).collection("notes").document(note.id)
         val boundedTags = note.tags.map { it.trim().take(40) }.filter { it.isNotEmpty() }.take(10)
         val boundedHistory = note.versionHistory.map { it.take(5000) }.take(10)
-        val updatedModel = note.copy(
-            userId = uid,
-            title = note.title.take(200),
-            content = note.content.take(20000),
-            folderId = note.folderId.trim().take(128),
-            category = note.category.ifBlank { "General" }.take(50),
-            tags = boundedTags,
-            colorHex = note.colorHex.take(20),
-            trashedAtEpochMillis = note.trashedAtEpochMillis.coerceAtLeast(0L),
-            passwordHash = note.passwordHash.take(256),
-            encryptedPayload = note.encryptedPayload.take(30000),
-            reminderEpochMillis = note.reminderEpochMillis.coerceAtLeast(0L),
-            reminderLabel = note.reminderLabel.take(100),
-            versionHistory = boundedHistory,
-            updatedAt = null
+        val updatePayload = mapOf<String, Any>(
+            "title" to note.title.take(200),
+            "content" to note.content.take(20000),
+            "folderId" to note.folderId.trim().take(128),
+            "category" to note.category.ifBlank { "General" }.take(50),
+            "tags" to boundedTags,
+            "colorHex" to note.colorHex.ifBlank { "#1E293B" }.take(20),
+            "isPinned" to note.isPinned,
+            "isArchived" to note.isArchived,
+            "isTrashed" to note.isTrashed,
+            "trashedAtEpochMillis" to note.trashedAtEpochMillis.coerceAtLeast(0L),
+            "isLocked" to note.isLocked,
+            "passwordHash" to note.passwordHash.take(256),
+            "encryptedPayload" to note.encryptedPayload.take(30000),
+            "reminderEpochMillis" to note.reminderEpochMillis.coerceAtLeast(0L),
+            "reminderLabel" to note.reminderLabel.take(100),
+            "versionHistory" to boundedHistory,
+            "updatedAt" to FieldValue.serverTimestamp()
         )
         return try {
-            docRef.set(updatedModel).await()
+            try {
+                docRef.update(updatePayload).await()
+            } catch (updateErr: com.google.firebase.firestore.FirebaseFirestoreException) {
+                if (updateErr.code == com.google.firebase.firestore.FirebaseFirestoreException.Code.NOT_FOUND) {
+                    val fullPayload = updatePayload + mapOf(
+                        "userId" to uid,
+                        "createdAt" to (note.createdAt ?: FieldValue.serverTimestamp())
+                    )
+                    docRef.set(fullPayload).await()
+                } else {
+                    throw updateErr
+                }
+            }
             Result.success(Unit)
         } catch (e: CancellationException) {
             throw e
@@ -259,17 +384,38 @@ class NoteRepository(
         }
     }
 
-    suspend fun createCategory(name: String, colorHex: String = "#F59E0B"): Result<String> {
+    suspend fun createCategory(
+        name: String,
+        colorHex: String = "#F59E0B",
+        preferredId: String = ""
+    ): Result<String> {
         val uid = requireUserId()
-        val docRef = db.collection("users").document(uid).collection("categories").document()
+        val cleanName = name.trim().take(40)
+        if (cleanName.isBlank()) {
+            return Result.failure(IllegalArgumentException("Category name cannot be blank"))
+        }
+        val cleanPreferredId = NoteSyncDeduplicator.sanitizeDocumentId(preferredId)
+        val categoriesCol = db.collection("users").document(uid).collection("categories")
+        val docRef = if (cleanPreferredId.isNotBlank()) {
+            categoriesCol.document(cleanPreferredId)
+        } else {
+            categoriesCol.document()
+        }
         val payload = mapOf(
             "userId" to uid,
-            "name" to name.trim().take(40),
-            "colorHex" to colorHex.take(20),
+            "name" to cleanName,
+            "colorHex" to colorHex.ifBlank { "#F59E0B" }.take(20),
             "createdAt" to FieldValue.serverTimestamp()
         )
         return try {
-            docRef.set(payload).await()
+            if (cleanPreferredId.isNotBlank()) {
+                val existingDoc = runCatching { docRef.get().await() }.getOrNull()
+                if (existingDoc == null || !existingDoc.exists()) {
+                    docRef.set(payload).await()
+                }
+            } else {
+                docRef.set(payload).await()
+            }
             Result.success(docRef.id)
         } catch (e: CancellationException) {
             throw e
@@ -296,24 +442,42 @@ class NoteRepository(
     suspend fun createFolder(
         name: String,
         parentFolderId: String = "",
-        colorHex: String = "#F59E0B"
+        colorHex: String = "#F59E0B",
+        preferredId: String = ""
     ): Result<String> {
         val uid = requireUserId()
         val cleanName = name.trim().take(60)
         if (cleanName.isBlank()) {
             return Result.failure(IllegalArgumentException("Folder name cannot be blank"))
         }
-        val docRef = db.collection("users").document(uid).collection("folders").document()
-        val payload = mapOf(
-            "userId" to uid,
+        val cleanPreferredId = NoteSyncDeduplicator.sanitizeDocumentId(preferredId)
+        val foldersCol = db.collection("users").document(uid).collection("folders")
+        val docRef = if (cleanPreferredId.isNotBlank()) {
+            foldersCol.document(cleanPreferredId)
+        } else {
+            foldersCol.document()
+        }
+        val basePayload = mapOf<String, Any>(
             "name" to cleanName,
             "parentFolderId" to parentFolderId.trim().take(128),
             "colorHex" to colorHex.ifBlank { "#F59E0B" }.take(20),
-            "createdAt" to FieldValue.serverTimestamp(),
             "updatedAt" to FieldValue.serverTimestamp()
         )
+        val createPayload = basePayload + mapOf(
+            "userId" to uid,
+            "createdAt" to FieldValue.serverTimestamp()
+        )
         return try {
-            docRef.set(payload).await()
+            if (cleanPreferredId.isNotBlank()) {
+                val existingDoc = runCatching { docRef.get().await() }.getOrNull()
+                if (existingDoc != null && existingDoc.exists()) {
+                    docRef.update(basePayload).await()
+                } else {
+                    docRef.set(createPayload).await()
+                }
+            } else {
+                docRef.set(createPayload).await()
+            }
             Result.success(docRef.id)
         } catch (e: CancellationException) {
             throw e
@@ -326,17 +490,27 @@ class NoteRepository(
     suspend fun updateFolder(folder: Folder): Result<Unit> {
         val uid = requireUserId()
         require(folder.id.isNotBlank()) { "Folder ID must not be blank for update" }
-        requireNotNull(folder.createdAt) { "Folder createdAt must not be null for update" }
         val docRef = db.collection("users").document(uid).collection("folders").document(folder.id)
-        val updatedModel = folder.copy(
-            userId = uid,
-            name = folder.name.trim().ifBlank { "Untitled Folder" }.take(60),
-            parentFolderId = folder.parentFolderId.trim().take(128),
-            colorHex = folder.colorHex.ifBlank { "#F59E0B" }.take(20),
-            updatedAt = null
+        val updatePayload = mapOf<String, Any>(
+            "name" to folder.name.trim().ifBlank { "Untitled Folder" }.take(60),
+            "parentFolderId" to folder.parentFolderId.trim().take(128),
+            "colorHex" to folder.colorHex.ifBlank { "#F59E0B" }.take(20),
+            "updatedAt" to FieldValue.serverTimestamp()
         )
         return try {
-            docRef.set(updatedModel).await()
+            try {
+                docRef.update(updatePayload).await()
+            } catch (updateErr: com.google.firebase.firestore.FirebaseFirestoreException) {
+                if (updateErr.code == com.google.firebase.firestore.FirebaseFirestoreException.Code.NOT_FOUND) {
+                    val fullPayload = updatePayload + mapOf(
+                        "userId" to uid,
+                        "createdAt" to (folder.createdAt ?: FieldValue.serverTimestamp())
+                    )
+                    docRef.set(fullPayload).await()
+                } else {
+                    throw updateErr
+                }
+            }
             Result.success(Unit)
         } catch (e: CancellationException) {
             throw e

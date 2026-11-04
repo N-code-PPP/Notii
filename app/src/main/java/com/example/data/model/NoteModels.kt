@@ -3,6 +3,7 @@ package com.example.data.model
 import com.google.firebase.Timestamp
 import com.google.firebase.firestore.DocumentId
 import com.google.firebase.firestore.IgnoreExtraProperties
+import com.google.firebase.firestore.PropertyName
 import com.google.firebase.firestore.ServerTimestamp
 import org.json.JSONObject
 
@@ -16,11 +17,11 @@ data class Note(
     val category: String = "General",
     val tags: List<String> = emptyList(),
     val colorHex: String = "#1E293B",
-    val isPinned: Boolean = false,
-    val isArchived: Boolean = false,
-    val isTrashed: Boolean = false,
+    @get:PropertyName("isPinned") @field:PropertyName("isPinned") val isPinned: Boolean = false,
+    @get:PropertyName("isArchived") @field:PropertyName("isArchived") val isArchived: Boolean = false,
+    @get:PropertyName("isTrashed") @field:PropertyName("isTrashed") val isTrashed: Boolean = false,
     val trashedAtEpochMillis: Long = 0L,
-    val isLocked: Boolean = false,
+    @get:PropertyName("isLocked") @field:PropertyName("isLocked") val isLocked: Boolean = false,
     val passwordHash: String = "",
     val encryptedPayload: String = "",
     val reminderEpochMillis: Long = 0L,
